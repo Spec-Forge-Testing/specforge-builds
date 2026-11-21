@@ -5,15 +5,19 @@ name: Installers
 
 on:
     workflow_dispatch:
-    push:
-        branches:
-            - 'check/**'
+        inputs:
+            version:
+                description: Version to install (e.g. v0.2.2); empty lets the installer look up the latest
+                required: false
 
 permissions:
     contents: read
 
 env:
     INSTALLERS: https://raw.githubusercontent.com/Spec-Forge-Testing/specforge-releases/master
+    # The installers read this: a version given here skips their lookup of the latest release,
+    # which GitHub's API refuses to machines that share an address with many others.
+    SPECFORGE_VERSION: ${{ inputs.version }}
 
 jobs:
     install:
