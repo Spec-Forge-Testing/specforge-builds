@@ -13,28 +13,33 @@ To install Spec Forge, go to
 macOS Intel:
 
 - the core, from the commit you give;
-- the desktop installer (`.exe` and `.msi`, `.deb`, `.dmg`);
-- the VS Code package (`.vsix`) with the core inside.
+- the desktop installer (`.exe` and `.msi`, `.deb`, `.dmg`) and the VS Code package (`.vsix`),
+  each with that core inside;
+- the CLI archive (`.zip`, `.tar.xz`), with that core inside.
 
 Run it from the Actions tab (**Release** → **Run workflow**):
 
 | Input | What it is |
 | --- | --- |
-| `version` | The version to release. The desktop app and the extension must already declare it. |
+| `version` | The version to release. Every source given below must already declare it. |
 | `core_ref` | Commit of the core to build. |
-| `desktop_ref` | Commit of the desktop app and the extension to build. |
 | `protocol_version` | Protocol version the built core must answer the handshake with. |
+| `desktop_ref` | Commit of the desktop app and the extension. Empty: neither is built. |
+| `cli_ref` | Commit of the CLI. Empty: it is not built. |
 | `highlights` | Optional "What is new" items, separated by `;`. |
 | `publish` | Off: the files stay attached to the run for seven days. On: see below. |
 
-With `publish` on, it creates `v<version>` (desktop) and `vscode-v<version>` (extension) in
-specforge-releases, with the notes from `notes/`, and opens a pull request there that points
-the README's download links at the new version. It refuses to overwrite a version that is
-already published.
+With `publish` on, it creates in specforge-releases `v<version>` (desktop), `vscode-v<version>`
+(extension) and `cli-v<version>` (CLI, with its `SHA256SUMS`) for what was built, with the notes
+from `notes/`, and opens a pull request there that points the README's download links at the
+new version. It refuses to overwrite a version that is already published.
+
+It does not build the container image `specforge ci init` points a pipeline at: that one is
+published by the CLI's own release workflow.
 
 It needs two repository secrets:
 
-- `SOURCE_READ_TOKEN`: reads the contents of the two source repositories and nothing else.
+- `SOURCE_READ_TOKEN`: reads the contents of the three source repositories and nothing else.
 - `RELEASES_WRITE_TOKEN`: writes contents and pull requests in specforge-releases and nothing
   else.
 

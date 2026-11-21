@@ -1,7 +1,7 @@
 name: Release
 
-# Builds the desktop installers and the VS Code packages for Windows, Linux and macOS from the
-# private source repositories and, when asked to, publishes them to specforge-releases.
+# Builds the desktop installers, the VS Code packages and the CLI for Windows, Linux and macOS
+# from the private source repositories and, when asked to, publishes them to specforge-releases.
 # This repository is public, so its logs are too: build output goes to files and only the tail
 # of a failed step is printed. Nothing but the finished binaries is uploaded.
 
@@ -9,17 +9,20 @@ on:
     workflow_dispatch:
         inputs:
             version:
-                description: Version to release, as the desktop app and the extension declare it (e.g. 0.3.0)
+                description: Version to release, as every source given below declares it (e.g. 0.3.0)
                 required: true
             core_ref:
                 description: Commit of the core (llm-pbt-agent) to build
                 required: true
-            desktop_ref:
-                description: Commit of the desktop app and the extension (llm-pbt-desktop) to build
-                required: true
             protocol_version:
                 description: Protocol version the built core must answer the handshake with
                 required: true
+            desktop_ref:
+                description: Commit of the desktop app and the extension (llm-pbt-desktop); empty skips both
+                required: false
+            cli_ref:
+                description: Commit of the CLI (specforge-cli); empty skips it
+                required: false
             highlights:
                 description: What is new, one item per ";" (optional)
                 required: false
@@ -28,6 +31,8 @@ on:
                 type: boolean
                 default: false
 
+run-name: Release ${{ inputs.version }}${{ inputs.publish && '' || ' (build only)' }}
+
 permissions:
     contents: read
 
@@ -35,8 +40,11 @@ env:
     VERSION: ${{ inputs.version }}
     CORE_REF: ${{ inputs.core_ref }}
     DESKTOP_REF: ${{ inputs.desktop_ref }}
+    CLI_REF: ${{ inputs.cli_ref }}
     PROTOCOL_VERSION: ${{ inputs.protocol_version }}
     RELEASES_REPO: Spec-Forge-Testing/specforge-releases
+    # The same PyInstaller the core's own build pins.
+    PYINSTALLER: pyinstaller==6.22.3
 
 defaults:
     run:
@@ -52,18 +60,22 @@ jobs:
                       rust_target: x86_64-pc-windows-msvc
                       vsce_target: win32-x64
                       bundles: nsis,msi
+                      cli_platform: windows-x86_64
                     - runner: ubuntu-22.04
                       rust_target: x86_64-unknown-linux-gnu
                       vsce_target: linux-x64
                       bundles: deb
+                      cli_platform: linux-x86_64
                     - runner: macos-latest
                       rust_target: aarch64-apple-darwin
                       vsce_target: darwin-arm64
                       bundles: app,dmg
+                      cli_platform: macos-arm64
                     - runner: macos-15-intel
                       rust_target: x86_64-apple-darwin
                       vsce_target: darwin-x64
                       bundles: app,dmg
+                      cli_platform: macos-x86_64
         runs-on: ${{ matrix.runner }}
         steps:
             - name: Check out this repository
@@ -81,6 +93,7 @@ jobs:
                   persist-credentials: false
 
             - name: Check out the desktop app
+              if: inputs.desktop_ref != ''
               uses: actions/checkout@v4
               with:
                   repository: Spec-Forge-Testing/llm-pbt-desktop
@@ -89,22 +102,37 @@ jobs:
                   path: desktop
                   persist-credentials: false
 
+            - name: Check out the CLI
+              if: inputs.cli_ref != ''
+              uses: actions/checkout@v4
+              with:
+                  repository: Spec-Forge-Testing/specforge-cli
+                  ref: ${{ env.CLI_REF }}
+                  token: ${{ secrets.SOURCE_READ_TOKEN }}
+                  path: cli
+                  persist-credentials: false
+
             - uses: actions/setup-node@v4
               with:
                   node-version: 20
 
-            - name: Check the sources declare this version
-              run: node builds/scripts/check-version.mjs desktop "$VERSION"
+            - name: Check the desktop app and the extension declare this version
+              if: inputs.desktop_ref != ''
+              run: node builds/scripts/check-version.mjs desktop desktop "$VERSION"
+
+            - name: Check the CLI declares this version
+              if: inputs.cli_ref != ''
+              run: node builds/scripts/check-version.mjs cli cli "$VERSION"
 
             - name: Install Tauri Linux dependencies
-              if: runner.os == 'Linux'
+              if: runner.os == 'Linux' && inputs.desktop_ref != ''
               run: |
                   sudo apt-get update -qq
                   sudo apt-get install -y -qq libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev \
                     patchelf build-essential curl wget file libssl-dev libgtk-3-dev > /dev/null
 
-            # The Linux core is built with a Python that links against an old glibc, so the VS Code
-            # package runs on distributions older than the runner.
+            # The Linux core is built with a Python that links against an old glibc, so it runs on
+            # distributions older than the runner.
             - name: Set up Python (Linux)
               if: runner.os == 'Linux'
               run: |
@@ -120,6 +148,7 @@ jobs:
                   python-version: '3.11'
 
             - uses: dtolnay/rust-toolchain@stable
+              if: inputs.desktop_ref != ''
               with:
                   targets: ${{ matrix.rust_target }}
 
@@ -145,6 +174,7 @@ jobs:
               run: bash "$GITHUB_WORKSPACE/builds/scripts/check-handshake.sh" "$GITHUB_WORKSPACE/core/dist/specforge" "$PROTOCOL_VERSION"
 
             - name: Build the desktop installer
+              if: inputs.desktop_ref != ''
               working-directory: desktop
               run: |
                   npm ci --no-audit --no-fund > "$RUNNER_TEMP/npm.log" 2>&1 \
@@ -160,21 +190,65 @@ jobs:
                     -exec cp {} "$GITHUB_WORKSPACE/out/" \;
 
             - name: Build the VS Code package
+              if: inputs.desktop_ref != ''
               working-directory: desktop/src-vscode
               run: |
                   npm ci --no-audit --no-fund > "$RUNNER_TEMP/npm-vscode.log" 2>&1 \
                     || { tail -n 40 "$RUNNER_TEMP/npm-vscode.log"; exit 1; }
-                  # A macOS core is full of symbolic links, which vsce cannot package: the copy
+                  # A macOS core holds symbolic links, which vsce cannot package: the copy
                   # resolves them, and the handshake proves the resolved copy still runs.
                   echo "symbolic links in the core: $(find ../../core/dist/specforge -type l | wc -l)"
                   mkdir -p sidecar
                   cp -RL ../../core/dist/specforge/. sidecar/
-                  (cd "$RUNNER_TEMP" && bash "$GITHUB_WORKSPACE/builds/scripts/check-handshake.sh"                     "$GITHUB_WORKSPACE/desktop/src-vscode/sidecar" "$PROTOCOL_VERSION")
+                  sidecar="$PWD/sidecar"
+                  (cd "$RUNNER_TEMP" && bash "$GITHUB_WORKSPACE/builds/scripts/check-handshake.sh" "$sidecar" "$PROTOCOL_VERSION")
                   { npm run package:prepare \
                     && npx vsce package --target "${{ matrix.vsce_target }}" --no-dependencies --skip-license; } \
                     > "$RUNNER_TEMP/vsce.log" 2>&1 \
                     || { tail -n 40 "$RUNNER_TEMP/vsce.log"; exit 1; }
+                  mkdir -p "$GITHUB_WORKSPACE/out"
                   cp ./*.vsix "$GITHUB_WORKSPACE/out/"
+
+            # Built in an environment of its own, as the CLI's release does: the core's packages
+            # stay out of it. The core built above goes in core/, beside the CLI.
+            - name: Build the CLI
+              if: inputs.cli_ref != ''
+              working-directory: cli
+              run: |
+                  python -m venv "$RUNNER_TEMP/cli-venv"
+                  cli_python="$RUNNER_TEMP/cli-venv/bin/python"
+                  [ -x "$cli_python" ] || cli_python="$RUNNER_TEMP/cli-venv/Scripts/python.exe"
+                  ( "$cli_python" -m pip install --quiet "$PYINSTALLER" . \
+                    && cd packaging \
+                    && "$cli_python" -m PyInstaller --noconfirm --clean --distpath dist --workpath build specforge.spec ) \
+                    > "$RUNNER_TEMP/cli-build.log" 2>&1 \
+                    || { tail -n 40 "$RUNNER_TEMP/cli-build.log"; exit 1; }
+                  mkdir -p packaging/dist/specforge/core
+                  cp -R ../core/dist/specforge/. packaging/dist/specforge/core/
+                  ls packaging/dist/specforge
+
+            - name: Archive the CLI (Linux and macOS)
+              if: inputs.cli_ref != '' && runner.os != 'Windows'
+              working-directory: cli/packaging/dist
+              run: tar -cJf "specforge-v$VERSION-${{ matrix.cli_platform }}.tar.xz" specforge
+
+            - name: Archive the CLI (Windows)
+              if: inputs.cli_ref != '' && runner.os == 'Windows'
+              working-directory: cli/packaging/dist
+              shell: pwsh
+              run: Compress-Archive -Path specforge -DestinationPath "specforge-v$env:VERSION-${{ matrix.cli_platform }}.zip"
+
+            # What someone downloads is the archive, so that is what gets tried: unpacked
+            # somewhere else, the CLI has to start the core it carries.
+            - name: Check the archived CLI starts its core
+              if: inputs.cli_ref != ''
+              run: bash builds/scripts/check-cli-archive.sh cli/packaging/dist "$RUNNER_TEMP/cli-unpacked"
+
+            - name: Collect the CLI archive
+              if: inputs.cli_ref != ''
+              run: |
+                  mkdir -p out
+                  cp cli/packaging/dist/specforge-v* out/
 
             - name: List what was built
               run: ls -la out
@@ -203,25 +277,39 @@ jobs:
 
             - name: Refuse to overwrite a published version
               run: |
-                  for tag in "v$VERSION" "vscode-v$VERSION"; do
+                  tags=""
+                  [ -z "$DESKTOP_REF" ] || tags="v$VERSION vscode-v$VERSION"
+                  [ -z "$CLI_REF" ] || tags="$tags cli-v$VERSION"
+                  for tag in $tags; do
                     if gh release view "$tag" --repo "$RELEASES_REPO" > /dev/null 2>&1; then
                       echo "::error::$tag is already published in $RELEASES_REPO"
                       exit 1
                     fi
                   done
 
-            - name: Write the release notes
-              run: |
-                  python3 scripts/render-notes.py notes/desktop.md "$VERSION" "$HIGHLIGHTS" > desktop-notes.md
-                  python3 scripts/render-notes.py notes/vscode.md "$VERSION" "$HIGHLIGHTS" > vscode-notes.md
-
             - name: Publish the VS Code packages
+              if: inputs.desktop_ref != ''
               run: |
+                  python3 scripts/render-notes.py notes/vscode.md "$VERSION" "$HIGHLIGHTS" > vscode-notes.md
                   gh release create "vscode-v$VERSION" files/*.vsix --repo "$RELEASES_REPO" \
                     --title "Spec Forge for VS Code v$VERSION" --notes-file vscode-notes.md --latest=false
 
-            - name: Publish the desktop installers
+            # `specforge update` refuses an archive whose hash does not match SHA256SUMS, and
+            # install.sh, install.ps1 and `specforge update` only look at cli-v* releases.
+            - name: Publish the CLI
+              if: inputs.cli_ref != ''
               run: |
+                  python3 scripts/render-notes.py notes/cli.md "$VERSION" "$HIGHLIGHTS" > cli-notes.md
+                  mkdir cli-files
+                  mv files/specforge-v* cli-files/
+                  (cd cli-files && sha256sum -- * > SHA256SUMS)
+                  gh release create "cli-v$VERSION" cli-files/* --repo "$RELEASES_REPO" \
+                    --title "Spec Forge CLI v$VERSION" --notes-file cli-notes.md --latest=false
+
+            - name: Publish the desktop installers
+              if: inputs.desktop_ref != ''
+              run: |
+                  python3 scripts/render-notes.py notes/desktop.md "$VERSION" "$HIGHLIGHTS" > desktop-notes.md
                   shopt -s nullglob
                   gh release create "v$VERSION" files/*.exe files/*.msi files/*.deb files/*.dmg \
                     --repo "$RELEASES_REPO" \
@@ -231,7 +319,10 @@ jobs:
               run: |
                   gh repo clone "$RELEASES_REPO" releases -- --quiet
                   cd releases
-                  python3 ../scripts/bump-readme.py README.md "$VERSION"
+                  components=""
+                  [ -z "$DESKTOP_REF" ] || components="desktop"
+                  [ -z "$CLI_REF" ] || components="$components cli"
+                  python3 ../scripts/bump-readme.py README.md "$VERSION" $components
                   if git diff --quiet; then echo "README already names $VERSION"; exit 0; fi
                   branch="docs/readme-$VERSION"
                   git config user.name "specforge-builds"
@@ -242,4 +333,4 @@ jobs:
                   git push --quiet origin "$branch"
                   gh pr create --repo "$RELEASES_REPO" --head "$branch" \
                     --title "docs(readme): point the downloads at $VERSION" \
-                    --body "The desktop and VS Code releases $VERSION are published. This points the README's download links at them."
+                    --body "Version $VERSION is published. This points the README's download links at it."
