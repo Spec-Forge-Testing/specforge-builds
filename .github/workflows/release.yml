@@ -260,9 +260,85 @@ jobs:
                   if-no-files-found: error
                   retention-days: 7
 
+    # The image `specforge ci init` writes into a pipeline: tagged with the CLI's version and built
+    # from the same core commit its binaries carry. Always built and tried; pushed only on publish.
+    image:
+        if: inputs.cli_ref != ''
+        runs-on: ubuntu-22.04
+        permissions:
+            contents: read
+            packages: write
+        env:
+            IMAGE: ghcr.io/spec-forge-testing/specforge
+        steps:
+            - name: Check out this repository
+              uses: actions/checkout@v4
+              with:
+                  path: builds
+
+            - name: Check out the CLI
+              uses: actions/checkout@v4
+              with:
+                  repository: Spec-Forge-Testing/specforge-cli
+                  ref: ${{ env.CLI_REF }}
+                  token: ${{ secrets.SOURCE_READ_TOKEN }}
+                  path: cli
+                  persist-credentials: false
+
+            - name: Check out the core
+              uses: actions/checkout@v4
+              with:
+                  repository: Spec-Forge-Testing/llm-pbt-agent
+                  ref: ${{ env.CORE_REF }}
+                  token: ${{ secrets.SOURCE_READ_TOKEN }}
+                  path: core-source
+                  persist-credentials: false
+
+            - name: Check the CLI declares this version
+              run: node builds/scripts/check-version.mjs cli cli "$VERSION"
+
+            - uses: docker/setup-buildx-action@v3
+
+            - name: Build the image
+              run: |
+                  docker buildx build --load \
+                    -f cli/packaging/docker/Dockerfile \
+                    --build-context core=core-source \
+                    --label "org.opencontainers.image.version=$VERSION" \
+                    --label "dev.specforge.core=$CORE_REF" \
+                    -t "$IMAGE:$VERSION" cli \
+                    > "$RUNNER_TEMP/image-build.log" 2>&1 \
+                    || { tail -n 40 "$RUNNER_TEMP/image-build.log"; exit 1; }
+                  docker image inspect "$IMAGE:$VERSION" --format 'built: {{.Size}} bytes'
+
+            # The image starts and knows `ci`, which the general help does not list.
+            - name: Check the image starts
+              run: docker run --rm "$IMAGE:$VERSION" ci --help > /dev/null
+
+            - name: Log in to the registry
+              if: inputs.publish
+              uses: docker/login-action@v3
+              with:
+                  registry: ghcr.io
+                  username: ${{ github.actor }}
+                  password: ${{ secrets.GITHUB_TOKEN }}
+
+            - name: Refuse to replace a published image
+              if: inputs.publish
+              run: |
+                  if docker manifest inspect "$IMAGE:$VERSION" > /dev/null 2>&1; then
+                    echo "::error::$IMAGE:$VERSION is already published"
+                    exit 1
+                  fi
+
+            - name: Push the image
+              if: inputs.publish
+              run: docker push --quiet "$IMAGE:$VERSION"
+
     publish:
-        needs: build
-        if: inputs.publish
+        needs: [build, image]
+        # The image job is skipped when no CLI is released, and that must not skip this one.
+        if: ${{ !cancelled() && inputs.publish && needs.build.result == 'success' && (needs.image.result == 'success' || needs.image.result == 'skipped') }}
         runs-on: ubuntu-22.04
         env:
             GH_TOKEN: ${{ secrets.RELEASES_WRITE_TOKEN }}
