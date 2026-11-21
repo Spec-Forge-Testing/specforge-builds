@@ -164,10 +164,12 @@ jobs:
               run: |
                   npm ci --no-audit --no-fund > "$RUNNER_TEMP/npm-vscode.log" 2>&1 \
                     || { tail -n 40 "$RUNNER_TEMP/npm-vscode.log"; exit 1; }
+                  # A macOS core is full of symbolic links, which vsce cannot package: the copy
+                  # resolves them, and the handshake proves the resolved copy still runs.
+                  echo "symbolic links in the core: $(find ../../core/dist/specforge -type l | wc -l)"
                   mkdir -p sidecar
-                  cp -R ../../core/dist/specforge/. sidecar/
-                  # vsce reads every packaged file at once; macOS allows 256 open files by default.
-                  ulimit -n 10240 2> /dev/null || true
+                  cp -RL ../../core/dist/specforge/. sidecar/
+                  (cd "$RUNNER_TEMP" && bash "$GITHUB_WORKSPACE/builds/scripts/check-handshake.sh"                     "$GITHUB_WORKSPACE/desktop/src-vscode/sidecar" "$PROTOCOL_VERSION")
                   { npm run package:prepare \
                     && npx vsce package --target "${{ matrix.vsce_target }}" --no-dependencies --skip-license; } \
                     > "$RUNNER_TEMP/vsce.log" 2>&1 \
