@@ -1,0 +1,241 @@
+name: Release
+
+# Builds the desktop installers and the VS Code packages for Windows, Linux and macOS from the
+# private source repositories and, when asked to, publishes them to specforge-releases.
+# This repository is public, so its logs are too: build output goes to files and only the tail
+# of a failed step is printed. Nothing but the finished binaries is uploaded.
+
+on:
+    workflow_dispatch:
+        inputs:
+            version:
+                description: Version to release, as the desktop app and the extension declare it (e.g. 0.3.0)
+                required: true
+            core_ref:
+                description: Commit of the core (llm-pbt-agent) to build
+                required: true
+            desktop_ref:
+                description: Commit of the desktop app and the extension (llm-pbt-desktop) to build
+                required: true
+            protocol_version:
+                description: Protocol version the built core must answer the handshake with
+                required: true
+            highlights:
+                description: What is new, one item per ";" (optional)
+                required: false
+            publish:
+                description: Publish to specforge-releases (off = build only, files stay as artifacts)
+                type: boolean
+                default: false
+
+permissions:
+    contents: read
+
+env:
+    VERSION: ${{ inputs.version }}
+    CORE_REF: ${{ inputs.core_ref }}
+    DESKTOP_REF: ${{ inputs.desktop_ref }}
+    PROTOCOL_VERSION: ${{ inputs.protocol_version }}
+    RELEASES_REPO: Spec-Forge-Testing/specforge-releases
+
+defaults:
+    run:
+        shell: bash
+
+jobs:
+    build:
+        strategy:
+            fail-fast: false
+            matrix:
+                include:
+                    - runner: windows-latest
+                      rust_target: x86_64-pc-windows-msvc
+                      vsce_target: win32-x64
+                      bundles: nsis,msi
+                    - runner: ubuntu-22.04
+                      rust_target: x86_64-unknown-linux-gnu
+                      vsce_target: linux-x64
+                      bundles: deb
+                    - runner: macos-latest
+                      rust_target: aarch64-apple-darwin
+                      vsce_target: darwin-arm64
+                      bundles: app,dmg
+                    - runner: macos-15-intel
+                      rust_target: x86_64-apple-darwin
+                      vsce_target: darwin-x64
+                      bundles: app,dmg
+        runs-on: ${{ matrix.runner }}
+        steps:
+            - name: Check out this repository
+              uses: actions/checkout@v4
+              with:
+                  path: builds
+
+            - name: Check out the core
+              uses: actions/checkout@v4
+              with:
+                  repository: Spec-Forge-Testing/llm-pbt-agent
+                  ref: ${{ env.CORE_REF }}
+                  token: ${{ secrets.SOURCE_READ_TOKEN }}
+                  path: core
+                  persist-credentials: false
+
+            - name: Check out the desktop app
+              uses: actions/checkout@v4
+              with:
+                  repository: Spec-Forge-Testing/llm-pbt-desktop
+                  ref: ${{ env.DESKTOP_REF }}
+                  token: ${{ secrets.SOURCE_READ_TOKEN }}
+                  path: desktop
+                  persist-credentials: false
+
+            - uses: actions/setup-node@v4
+              with:
+                  node-version: 20
+
+            - name: Check the sources declare this version
+              run: node builds/scripts/check-version.mjs desktop "$VERSION"
+
+            - name: Install Tauri Linux dependencies
+              if: runner.os == 'Linux'
+              run: |
+                  sudo apt-get update -qq
+                  sudo apt-get install -y -qq libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev \
+                    patchelf build-essential curl wget file libssl-dev libgtk-3-dev > /dev/null
+
+            # The Linux core is built with a Python that links against an old glibc, so the VS Code
+            # package runs on distributions older than the runner.
+            - name: Set up Python (Linux)
+              if: runner.os == 'Linux'
+              run: |
+                  curl -LsSf https://astral.sh/uv/install.sh | sh > /dev/null
+                  "$HOME/.local/bin/uv" venv --quiet --python 3.11 "$RUNNER_TEMP/venv"
+                  "$HOME/.local/bin/uv" pip install --quiet --python "$RUNNER_TEMP/venv/bin/python" pip
+                  echo "$RUNNER_TEMP/venv/bin" >> "$GITHUB_PATH"
+
+            - name: Set up Python (Windows and macOS)
+              if: runner.os != 'Linux'
+              uses: actions/setup-python@v5
+              with:
+                  python-version: '3.11'
+
+            - uses: dtolnay/rust-toolchain@stable
+              with:
+                  targets: ${{ matrix.rust_target }}
+
+            - name: Build the core
+              working-directory: core
+              run: |
+                  python -m pip install --quiet --upgrade pip
+                  python scripts/build-sidecar.py --target-triple "${{ matrix.rust_target }}" \
+                    > "$RUNNER_TEMP/core-build.log" 2>&1 \
+                    || { tail -n 40 "$RUNNER_TEMP/core-build.log"; exit 1; }
+                  ls dist/specforge
+
+            # PyInstaller copies the runner's C++ runtime in; the target's own is used instead, so
+            # the core does not ask for the runner's glibc.
+            - name: Keep the Linux core portable
+              if: runner.os == 'Linux'
+              run: |
+                  rm -f core/dist/specforge/_internal/libstdc++.so.6 core/dist/specforge/_internal/libgcc_s.so.1
+                  bash builds/scripts/check-glibc-floor.sh core/dist/specforge 2.28
+
+            - name: Check the core answers the handshake
+              working-directory: ${{ runner.temp }}
+              run: bash "$GITHUB_WORKSPACE/builds/scripts/check-handshake.sh" "$GITHUB_WORKSPACE/core/dist/specforge" "$PROTOCOL_VERSION"
+
+            - name: Build the desktop installer
+              working-directory: desktop
+              run: |
+                  npm ci --no-audit --no-fund > "$RUNNER_TEMP/npm.log" 2>&1 \
+                    || { tail -n 40 "$RUNNER_TEMP/npm.log"; exit 1; }
+                  mkdir -p src-tauri/binaries
+                  cp -R ../core/dist/specforge/. src-tauri/binaries/
+                  npx tauri build --target "${{ matrix.rust_target }}" --bundles "${{ matrix.bundles }}" \
+                    > "$RUNNER_TEMP/tauri.log" 2>&1 \
+                    || { tail -n 40 "$RUNNER_TEMP/tauri.log"; exit 1; }
+                  mkdir -p "$GITHUB_WORKSPACE/out"
+                  find "src-tauri/target/${{ matrix.rust_target }}/release/bundle" -maxdepth 2 -type f \
+                    \( -name '*.exe' -o -name '*.msi' -o -name '*.deb' -o -name '*.dmg' \) \
+                    -exec cp {} "$GITHUB_WORKSPACE/out/" \;
+
+            - name: Build the VS Code package
+              working-directory: desktop/src-vscode
+              run: |
+                  npm ci --no-audit --no-fund > "$RUNNER_TEMP/npm-vscode.log" 2>&1 \
+                    || { tail -n 40 "$RUNNER_TEMP/npm-vscode.log"; exit 1; }
+                  mkdir -p sidecar
+                  cp -R ../../core/dist/specforge/. sidecar/
+                  { npm run package:prepare \
+                    && npx vsce package --target "${{ matrix.vsce_target }}" --no-dependencies --skip-license; } \
+                    > "$RUNNER_TEMP/vsce.log" 2>&1 \
+                    || { tail -n 40 "$RUNNER_TEMP/vsce.log"; exit 1; }
+                  cp ./*.vsix "$GITHUB_WORKSPACE/out/"
+
+            - name: List what was built
+              run: ls -la out
+
+            - uses: actions/upload-artifact@v4
+              with:
+                  name: build-${{ matrix.vsce_target }}
+                  path: out/*
+                  if-no-files-found: error
+                  retention-days: 7
+
+    publish:
+        needs: build
+        if: inputs.publish
+        runs-on: ubuntu-22.04
+        env:
+            GH_TOKEN: ${{ secrets.RELEASES_WRITE_TOKEN }}
+            HIGHLIGHTS: ${{ inputs.highlights }}
+        steps:
+            - uses: actions/checkout@v4
+
+            - uses: actions/download-artifact@v4
+              with:
+                  path: files
+                  merge-multiple: true
+
+            - name: Refuse to overwrite a published version
+              run: |
+                  for tag in "v$VERSION" "vscode-v$VERSION"; do
+                    if gh release view "$tag" --repo "$RELEASES_REPO" > /dev/null 2>&1; then
+                      echo "::error::$tag is already published in $RELEASES_REPO"
+                      exit 1
+                    fi
+                  done
+
+            - name: Write the release notes
+              run: |
+                  python3 scripts/render-notes.py notes/desktop.md "$VERSION" "$HIGHLIGHTS" > desktop-notes.md
+                  python3 scripts/render-notes.py notes/vscode.md "$VERSION" "$HIGHLIGHTS" > vscode-notes.md
+
+            - name: Publish the VS Code packages
+              run: |
+                  gh release create "vscode-v$VERSION" files/*.vsix --repo "$RELEASES_REPO" \
+                    --title "Spec Forge for VS Code v$VERSION" --notes-file vscode-notes.md --latest=false
+
+            - name: Publish the desktop installers
+              run: |
+                  shopt -s nullglob
+                  gh release create "v$VERSION" files/*.exe files/*.msi files/*.deb files/*.dmg \
+                    --repo "$RELEASES_REPO" \
+                    --title "Spec Forge Desktop v$VERSION" --notes-file desktop-notes.md --latest
+
+            - name: Propose the README with the new version
+              run: |
+                  gh repo clone "$RELEASES_REPO" releases -- --quiet
+                  cd releases
+                  python3 ../scripts/bump-readme.py README.md "$VERSION"
+                  if git diff --quiet; then echo "README already names $VERSION"; exit 0; fi
+                  branch="docs/readme-$VERSION"
+                  git config user.name "specforge-builds"
+                  git config user.email "specforge-builds@users.noreply.github.com"
+                  git checkout --quiet -b "$branch"
+                  git commit --quiet -am "docs(readme): point the downloads at $VERSION"
+                  git remote set-url origin "https://x-access-token:${GH_TOKEN}@github.com/${RELEASES_REPO}.git"
+                  git push --quiet origin "$branch"
+                  gh pr create --repo "$RELEASES_REPO" --head "$branch" \
+                    --title "docs(readme): point the downloads at $VERSION" \
+                    --body "The desktop and VS Code releases $VERSION are published. This points the README's download links at them."
