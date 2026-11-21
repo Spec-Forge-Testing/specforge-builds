@@ -31,7 +31,7 @@ on:
                 type: boolean
                 default: false
 
-run-name: Release ${{ inputs.version }}${{ inputs.publish && '' || ' (build only)' }}
+run-name: Release ${{ inputs.version }} (${{ inputs.publish && 'publish' || 'build only' }})
 
 permissions:
     contents: read
