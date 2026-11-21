@@ -1,0 +1,49 @@
+name: Installers
+
+# Installs the published CLI the way its README says, on a real machine of each system, and
+# checks the installed CLI starts its core.
+
+on:
+    workflow_dispatch:
+        inputs:
+            version:
+                description: Version to install (e.g. v0.2.2); empty lets the installer look up the latest
+                required: false
+
+permissions:
+    contents: read
+
+env:
+    INSTALLERS: https://raw.githubusercontent.com/Spec-Forge-Testing/specforge-releases/master
+    # The installers read this: a version given here skips their lookup of the latest release,
+    # which GitHub's API refuses to machines that share an address with many others.
+    SPECFORGE_VERSION: ${{ inputs.version }}
+
+jobs:
+    install:
+        strategy:
+            fail-fast: false
+            matrix:
+                runner: [ubuntu-22.04, macos-latest, macos-15-intel, windows-latest]
+        runs-on: ${{ matrix.runner }}
+        steps:
+            - name: Install (Linux and macOS)
+              if: runner.os != 'Windows'
+              run: |
+                  curl -fsSL "$INSTALLERS/install.sh" | sh
+                  echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+            - name: Install (Windows)
+              if: runner.os == 'Windows'
+              shell: pwsh
+              run: |
+                  Invoke-RestMethod "$env:INSTALLERS/install.ps1" | Invoke-Expression
+                  Join-Path $env:LOCALAPPDATA "specforge" | Out-File -FilePath $env:GITHUB_PATH -Append
+
+            # `describe` asks the core for its catalog: the installed CLI started the core it carries.
+            - name: The installed CLI starts its core
+              shell: bash
+              run: |
+                  specforge describe --json-output > /dev/null
+                  echo "specforge is $(command -v specforge)"
+
