@@ -166,6 +166,8 @@ jobs:
                     || { tail -n 40 "$RUNNER_TEMP/npm-vscode.log"; exit 1; }
                   mkdir -p sidecar
                   cp -R ../../core/dist/specforge/. sidecar/
+                  # vsce reads every packaged file at once; macOS allows 256 open files by default.
+                  ulimit -n 10240 2> /dev/null || true
                   { npm run package:prepare \
                     && npx vsce package --target "${{ matrix.vsce_target }}" --no-dependencies --skip-license; } \
                     > "$RUNNER_TEMP/vsce.log" 2>&1 \
