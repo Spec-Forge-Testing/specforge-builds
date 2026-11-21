@@ -34,8 +34,11 @@ With `publish` on, it creates in specforge-releases `v<version>` (desktop), `vsc
 from `notes/`, and opens a pull request there that points the README's download links at the
 new version. It refuses to overwrite a version that is already published.
 
-It does not build the container image `specforge ci init` points a pipeline at: that one is
-published by the CLI's own release workflow.
+When a CLI is given it also builds the container image `specforge ci init` points a pipeline
+at, `ghcr.io/spec-forge-testing/specforge:<version>`, from the same core commit, and checks it
+starts. With `publish` on, the image is pushed before the releases are created, and never over a
+tag that already exists. The package has to grant this repository write access (its settings →
+Manage Actions access).
 
 It needs two repository secrets:
 
